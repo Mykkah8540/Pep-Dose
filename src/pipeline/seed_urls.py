@@ -20,6 +20,7 @@ BLOCKED_SLUGS = {
     "contact-us",
     "privacy-policy",
     "terms-of-service",
+    "terms-and-conditions",
     "shipping-policy",
     "refund-policy",
     "returns",
