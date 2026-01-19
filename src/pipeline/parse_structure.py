@@ -1,6 +1,5 @@
 import argparse
 import json
-import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -17,78 +16,98 @@ def _clean(s: str) -> str:
     s = " ".join(s.split())
     return s.strip()
 
-def _heading_level(name: str) -> int:
-    if name and name.startswith("h") and len(name) == 2 and name[1].isdigit():
+def _heading_level(tag: Tag) -> int:
+    name = (tag.name or "").lower()
+    if len(name) == 2 and name[0] == "h" and name[1].isdigit():
         return int(name[1])
     return 9
 
 def _pick_container(soup: BeautifulSoup) -> Tag:
-    # Prefer main/article; if missing, fallback to body.
     return soup.find("main") or soup.find("article") or soup.body or soup
 
-def _pick_best_h1(container: Tag) -> str:
-    # Many themes have a site header H1 ("Research Dosing") plus a page title elsewhere.
-    # Choose the longest non-empty H1 that isn't the brand.
+def _pick_best_title(container: Tag) -> str:
+    # Prefer a non-brand h1 inside the container
     brand = {"research dosing"}
-    candidates = []
+    h1s = []
     for h in container.find_all("h1"):
         t = _clean(h.get_text(" ", strip=True))
-        if not t:
-            continue
-        if t.lower() in brand:
-            continue
-        candidates.append(t)
-    if candidates:
-        return max(candidates, key=len)
+        if t and t.lower() not in brand:
+            h1s.append(t)
+    if h1s:
+        return max(h1s, key=len)
 
-    # fallback: some pages use h2/h3 for title
-    for sel in ["h2", "h3"]:
-        h = container.find(sel)
+    # Fallback: first h2/h3 that isn't brand
+    for tag_name in ("h2", "h3"):
+        h = container.find(tag_name)
         if h:
             t = _clean(h.get_text(" ", strip=True))
             if t and t.lower() not in brand:
                 return t
     return ""
 
-def _extract_blocks_recursive(node: Tag) -> List[Dict[str, Any]]:
+def _collect_blocks_between(start_h: Tag, end_h: Optional[Tag]) -> List[Dict[str, Any]]:
     """
-    Extract paragraphs, lists, and tables recursively within node.
-    Keep ordering coarse but deterministic.
+    Walk DOM from start_h forward until end_h (exclusive), collecting:
+    - paragraphs
+    - lists (as list blocks)
+    - tables
     """
     blocks: List[Dict[str, Any]] = []
+    seen_lists = set()
 
-    # paragraphs
-    for p in node.find_all("p"):
+    def add_paragraph(p: Tag):
         txt = _clean(p.get_text(" ", strip=True))
         if txt:
             blocks.append({"type": "paragraph", "text": txt})
 
-    # lists
-    for ul in node.find_all(["ul", "ol"]):
+    def add_list(lst: Tag):
+        # prevent double-adding nested lists
+        if id(lst) in seen_lists:
+            return
+        seen_lists.add(id(lst))
         items = []
-        for li in ul.find_all("li"):
+        for li in lst.find_all("li"):
             t = _clean(li.get_text(" ", strip=True))
             if t:
                 items.append(t)
         if items:
-            blocks.append({"type": "list", "ordered": ul.name == "ol", "items": items})
+            blocks.append({"type": "list", "ordered": lst.name == "ol", "items": items})
 
-    # tables
-    for table in node.find_all("table"):
+    def add_table(table: Tag):
         rows = []
         for tr in table.find_all("tr"):
-            cells = [_clean(td.get_text(" ", strip=True)) for td in tr.find_all(["th", "td"])]
-            cells = [c for c in cells if c]
+            cells = []
+            for td in tr.find_all(["th", "td"]):
+                c = _clean(td.get_text(" ", strip=True))
+                if c:
+                    cells.append(c)
             if cells:
                 rows.append(cells)
         if rows:
             blocks.append({"type": "table", "rows": rows})
 
-    # If we got nothing, fallback to raw text snippet (prevents empty sections)
+    for el in start_h.next_elements:
+        if end_h is not None and el is end_h:
+            break
+        if not isinstance(el, Tag):
+            continue
+
+        name = (el.name or "").lower()
+
+        # Stop if we hit ANY heading at same/higher boundary handled by caller
+        # (caller already chooses end_h), so we ignore headings here.
+
+        if name == "p":
+            add_paragraph(el)
+        elif name in ("ul", "ol"):
+            add_list(el)
+        elif name == "table":
+            add_table(el)
+
+    # If no structured blocks found, fallback to a compact text capture for the region
     if not blocks:
-        txt = _clean(node.get_text("\n", strip=True))
+        txt = _clean(start_h.parent.get_text("\n", strip=True)) if start_h.parent else ""
         if txt:
-            # collapse into manageable lines
             lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
             if lines:
                 blocks.append({"type": "raw_text", "text": "\n".join(lines[:200])})
@@ -97,16 +116,15 @@ def _extract_blocks_recursive(node: Tag) -> List[Dict[str, Any]]:
 
 def _parse_sections(html: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html, "lxml")
-
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
 
     title = _clean(soup.title.get_text(" ", strip=True)) if soup.title else ""
     container = _pick_container(soup)
-    h1 = _pick_best_h1(container)
+    page_h1 = _pick_best_title(container)
 
-    # headings within container (skip brand h1 if present)
-    headings = []
+    # headings inside container (ignore brand header)
+    headings: List[Tag] = []
     for h in container.find_all(["h1", "h2", "h3", "h4"]):
         t = _clean(h.get_text(" ", strip=True))
         if not t:
@@ -115,19 +133,21 @@ def _parse_sections(html: str) -> Dict[str, Any]:
             continue
         headings.append(h)
 
-    # If we can't find headings, treat whole container as one root section
+    # If no headings, treat whole container as ROOT
     if not headings:
+        txt = _clean(container.get_text("\n", strip=True))
         return {
             "title": title,
-            "h1": h1,
-            "sections": [{"path": ["ROOT"], "blocks": _extract_blocks_recursive(container)}],
+            "h1": page_h1,
+            "sections": [{"path": ["ROOT"], "blocks": [{"type": "raw_text", "text": txt}]}],
         }
 
+    # Build hierarchical paths + block regions
     sections: List[Dict[str, Any]] = []
     stack: List[Tuple[int, str]] = []
 
-    for h in headings:
-        level = _heading_level(h.name or "")
+    for idx, h in enumerate(headings):
+        level = _heading_level(h)
         heading_text = _clean(h.get_text(" ", strip=True))
 
         while stack and stack[-1][0] >= level:
@@ -135,33 +155,17 @@ def _parse_sections(html: str) -> Dict[str, Any]:
         stack.append((level, heading_text))
         path = [t for _, t in stack]
 
-        # Collect content until next heading of same/higher level
-        region_nodes: List[Tag] = []
-        node = h.next_sibling
-        steps = 0
-        while node is not None and steps < 800:
-            steps += 1
-            name = getattr(node, "name", None)
-            if isinstance(name, str) and name in ("h1", "h2", "h3", "h4"):
-                nxt_level = _heading_level(name)
-                if nxt_level <= level:
-                    break
-            if isinstance(node, Tag):
-                region_nodes.append(node)
-            node = getattr(node, "next_sibling", None)
+        # find next boundary heading of same or higher level
+        end_h = None
+        for j in range(idx + 1, len(headings)):
+            if _heading_level(headings[j]) <= level:
+                end_h = headings[j]
+                break
 
-        # Wrap region nodes into a temporary container for extraction
-        tmp = BeautifulSoup("<div></div>", "lxml").div
-        for n in region_nodes:
-            try:
-                tmp.append(n)
-            except Exception:
-                pass
-
-        blocks = _extract_blocks_recursive(tmp)
+        blocks = _collect_blocks_between(h, end_h)
         sections.append({"path": path, "blocks": blocks})
 
-    return {"title": title, "h1": h1, "sections": sections}
+    return {"title": title, "h1": page_h1, "sections": sections}
 
 def main() -> int:
     parser = argparse.ArgumentParser()
